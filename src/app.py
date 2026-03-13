@@ -5,19 +5,44 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
 from pathlib import Path
+import json
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Teachers are defined in JSON so school staff can be managed without code edits.
+teachers_file = current_dir / "teachers.json"
+
+
+def load_teachers() -> dict:
+    with open(teachers_file, "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    return {
+        teacher["username"]: teacher["password"]
+        for teacher in data.get("teachers", [])
+    }
+
+
+teacher_credentials = load_teachers()
+admin_sessions = {}
 
 # In-memory activity database
 activities = {
@@ -78,9 +103,58 @@ activities = {
 }
 
 
+def require_admin(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Teacher login is required")
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    username = admin_sessions.get(token)
+    if not username:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+
+    return username
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+@app.post("/admin/login")
+def admin_login(payload: AdminLoginRequest):
+    expected_password = teacher_credentials.get(payload.username)
+    if not expected_password or payload.password != expected_password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(24)
+    admin_sessions[token] = payload.username
+
+    return {
+        "message": "Teacher login successful",
+        "token": token,
+        "username": payload.username,
+    }
+
+
+@app.get("/admin/me")
+def admin_me(authorization: str | None = Header(default=None)):
+    username = require_admin(authorization)
+    return {"username": username}
+
+
+@app.post("/admin/logout")
+def admin_logout(authorization: str | None = Header(default=None)):
+    if not authorization:
+        return {"message": "Logged out"}
+
+    _, _, token = authorization.partition(" ")
+    if token in admin_sessions:
+        del admin_sessions[token]
+
+    return {"message": "Logged out"}
 
 
 @app.get("/activities")
@@ -89,8 +163,10 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, authorization: str | None = Header(default=None)):
     """Sign up a student for an activity"""
+    require_admin(authorization)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +187,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, authorization: str | None = Header(default=None)):
     """Unregister a student from an activity"""
+    require_admin(authorization)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
